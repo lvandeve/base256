@@ -412,7 +412,8 @@ std::map<int, int> inv1252 = invertTable(table1252);
 class Format {
  public:
   virtual ~Format() {}
-  virtual std::string encodeChar(unsigned char c) = 0;
+  // prev and next char not used by all formats, and set to 0 if nonexistant
+  virtual std::string encodeChar(unsigned char c, unsigned char prev, unsigned char next) = 0;
 
   virtual std::string decode(const std::string& s) {
     std::cerr << "Decode not implemented for this format!" << std::endl;
@@ -429,15 +430,56 @@ class Format {
   virtual bool space() const {
     return false;
   }
+
+  // whether this format prints most printable ascii characters as-is (small
+  // exceptions, such as escape codes for string literals, may happen).
+  // if this is true, then no separate "mix" mode that mixes in printable
+  // ascii characters in the notation will be supported for this format (since
+  // it already prints printable ascii characters on its own)
+  virtual bool printable() const {
+    return false;
+  }
+
+  // could be e.g. q quote character for C string literal
+  virtual std::string open() {
+    return "";
+  }
+
+  // could be e.g. q quote character for C string literal
+  virtual std::string close() {
+    return "";
+  }
+
+  // optional extra to begin in-between lines with, e.g. " for C string literal
+  virtual std::string linebeg() {
+    return "";
+  }
+
+  // optional extra to end in-between lines with, e.g. " for C string literal
+  virtual std::string lineend() {
+    return "";
+  }
+
+  // whether the string representation allows line wrapping at all
+  virtual bool allowlinebreaks() {
+    return true;
+  }
+
+  // align based on input byte size or output character size
+  virtual bool outwidth() {
+    return false;
+  }
 };
 
 class Printer {
  public:
   Printer(Format* n) : n(n) {}
 
-  std::string encodeChar(unsigned char c) {
-    std::string temp = n->encodeChar(c);
-    if(printspace && c == 32 && (n->encodeChar('!') == "!" || mix)) {
+  // width = original width before adding formatting like ANSI colors
+  std::string encodeChar(unsigned char c, unsigned char prev, unsigned char next, size_t* width) {
+    std::string temp = n->encodeChar(c, prev, next);
+    *width = temp.size();
+    if(printspace && c == 32 && (mix || n->printable())) {
       std::string result;
       for(size_t i = 0; i < n->width(); i++) {
         result += " ";
@@ -445,9 +487,9 @@ class Printer {
       return result;
     }
     if(temp == "\n") return temp;
-    if(c == 10 && printnewline && (n->encodeChar('!') == "!" || mix)) return "\n";
+    if(c == 10 && printnewline && (mix || n->printable())) return "\n";
     std::string result;
-    if(mix && c > 32 && c < 127) {
+    if(mix && c > 32 && c < 127 && !n->printable()) {
       size_t size = n->width() - 1;
       for(size_t i = 0; i < size; i++) {
         result += " ";
@@ -480,24 +522,39 @@ class Printer {
     size_t lnlen = valtostr(s.size(), linenumbersbase == 16).size();
     std::string result;
     for(int i = 0; i < s.size(); i++) {
+      bool wrapped = false;
       if(wrap && numbytes >= wrap) {
-        result += '\n';
+        result += n->lineend();
+        if(n->allowlinebreaks()) result += "\n";
         numbytes = 0;
+        wrapped = true;
       }
       if(printlinenumbers && numbytes == 0) {
         std::string ln = valtostr(i, linenumbersbase == 16);
         while (ln.size() < lnlen) ln = " " + ln;
         result += ln + ": ";
       }
-      std::string temp = encodeChar(s[i]);
+      if(i == 0) result += n->open();
+      if(wrapped) result += n->linebeg();
+      unsigned char prev = (i > 0) ? s[i - 1] : 0;
+      unsigned char next = (i + 1 < s.size()) ? s[i + 1] : 0;
+      size_t outwidth = 0;
+      std::string temp = encodeChar(s[i], prev, next, &outwidth);
       result += temp;
       if(comma) result += ",";
       if(comma || n->space()) result += " ";
       if(temp == "\n") {
         numbytes = 0;
       }
-      numbytes++;
+      if(n->outwidth()) {
+        // For C string literals, with variable length characters, align the width
+        // based on the output width rather than the input width.
+        numbytes += outwidth;
+      } else {
+        numbytes++;
+      }
     }
+    result += n->close();
     return result;
   }
 
@@ -523,7 +580,8 @@ class Printer {
       table += digits.substr(y, 1) + "|";
       for(int x = 0; x < 16; x++) {
         unsigned char c = y * 16 + x;
-        std::string s = encodeChar(c);
+        size_t outwidth = 0;
+        std::string s = encodeChar(c, 0, 0, &outwidth);
         if(s == "\n") {
           s = "";
           for(size_t j = 1; j < size; j++) s += " ";
@@ -554,7 +612,9 @@ class CP437 : public Format {
   CP437(bool newline, bool printnull) : newline(newline), printnull(printnull) {
   }
 
-  std::string encodeChar(unsigned char c) {
+  virtual bool printable() const { return true; }
+
+  std::string encodeChar(unsigned char c, unsigned char prev, unsigned char next) {
     if(newline && c == 10) return "\n";
     if(printnull && c == 0) return " ";
     return unicode_to_string({table437[c]});
@@ -587,7 +647,9 @@ class CP1252 : public Format {
   CP1252(bool newline, bool printnull) : newline(newline), printnull(printnull) {
   }
 
-  std::string encodeChar(unsigned char c) {
+  virtual bool printable() const { return true; }
+
+  std::string encodeChar(unsigned char c, unsigned char prev, unsigned char next) {
     if(newline && c == 10) return "\n";
     if(printnull && c == 0) return " ";
     return unicode_to_string({table1252[c]});
@@ -620,7 +682,7 @@ class Braille : public Format {
   Braille(bool newline, bool printnull) : newline(newline), printnull(printnull) {
   }
 
-  std::string encodeChar(unsigned char c) {
+  std::string encodeChar(unsigned char c, unsigned char prev, unsigned char next) {
     if(c == 0 && !printnull) return unicode_to_string({table437[0]});
     if(newline && c == 10) return "\n";
     return unicode_to_string({0x2800 + c});
@@ -635,7 +697,9 @@ class ASCII : public Format {
   ASCII(bool newline = false) : newline(newline) {
   }
 
-  std::string encodeChar(unsigned char c) {
+  virtual bool printable() const { return true; }
+
+  std::string encodeChar(unsigned char c, unsigned char prev, unsigned char next) {
     if(newline && c == 10) return "\n";
     if(c > 32 && c < 127) return std::string(1, (char)c);
     else return "?";
@@ -650,7 +714,7 @@ class Low : public Format {
       digits(lower ? digits_lower : digits_upper)  {
   }
 
-  std::string encodeChar(unsigned char c) {
+  std::string encodeChar(unsigned char c, unsigned char prev, unsigned char next) {
     return std::string("") + digits[c & 15];
   }
 
@@ -667,7 +731,7 @@ class High : public Format {
       digits(lower ? digits_lower : digits_upper)  {
   }
 
-  std::string encodeChar(unsigned char c) {
+  std::string encodeChar(unsigned char c, unsigned char prev, unsigned char next) {
     return std::string("") + digits[(c >> 4) & 15];
   }
 
@@ -684,7 +748,7 @@ class Hex : public Format {
       digits(lower ? digits_lower : digits_upper)  {
   }
 
-  std::string encodeChar(unsigned char c) {
+  std::string encodeChar(unsigned char c, unsigned char prev, unsigned char next) {
     std::string result;
     result += digits[(c >> 4) & 15];
     result += digits[c & 15];
@@ -737,7 +801,7 @@ class Decimal : public Format {
   Decimal(bool prefix = false) : prefix(prefix) {
   }
 
-  std::string encodeChar(unsigned char c) {
+  std::string encodeChar(unsigned char c, unsigned char prev, unsigned char next) {
     static const std::string d = "0123456789";
     std::string result;
     if(prefix) {
@@ -789,7 +853,7 @@ class Octal : public Format {
   Octal(bool prefix = false) : prefix(prefix) {
   }
 
-  std::string encodeChar(unsigned char c) {
+  std::string encodeChar(unsigned char c, unsigned char prev, unsigned char next) {
     static const std::string d = "01234567";
     std::string result;
     result += d[c / 64];
@@ -815,7 +879,7 @@ class Binary : public Format {
   Binary(bool prefix = false) : prefix(prefix) {
   }
 
-  std::string encodeChar(unsigned char c) {
+  std::string encodeChar(unsigned char c, unsigned char prev, unsigned char next) {
     std::string result;
     for(int j = 0; j < 8; j++) {
       result += ((c >> (7 - j)) & 1) ? '1' : '0';
@@ -842,10 +906,240 @@ class Colored : public Format {
   Colored() {
   }
 
-  std::string encodeChar(unsigned char c) {
+  std::string encodeChar(unsigned char c, unsigned char prev, unsigned char next) {
     std::string result;
     result = std::string() + "\x1b" + "[48;5;" + valtostr((int)c) + "m" + " " + "\x1b[0m";
     return result;
+  }
+};
+
+// strict ANSI-C compatible string
+class CString : public Format {
+ public:
+  CString() {}
+
+  virtual bool printable() const { return true; }
+
+  std::string encodeChar(unsigned char c, unsigned char prev, unsigned char next) {
+    if(c == '\a') return "\\a";
+    if(c == '\b') return "\\b";
+    if(c == '\f') return "\\f";
+    if(c == '\n') return "\\n";
+    if(c == '\r') return "\\r";
+    if(c == '\t') return "\\t";
+    if(c == '\v') return "\\v";
+    if(c == '\\') return "\\\\";
+    if(c == '"') return "\\\"";
+    if(c == '?' && prev == '?') return "\\?"; // prevent trigraphs
+    if(c >= 32 && c < 127) {
+      std::string result;
+      result += c;
+      return result;
+    }
+    // octal
+    // octal is used, not hexadecimal ("\x..."), because octal is defined to end after 3 characters, while
+    // hexadecimal can keep going on indefinitely (it doesn't end after 2) as long as valid hex digits follow,
+    // so hexadecimal is harder to deal with if an actual 0-7 or a-f character would follow (requires ending and reopening the string literal)
+    bool digitnext = (next >= '0' && next <= '7');
+    int o0 = (c >> 6) & 7;
+    int o1 = (c >> 3) & 7;
+    int o2 = (c >> 0) & 7;
+    std::string result = "\\";
+    // shorten if possible, e.g. many nulls in a row will be \0\0\0\0 instead of \000\\000\000\000
+    // using \0 and other less than 3 digit codes is only ok if no real octal digit after it, else the next character becomes part of the code
+    if(c < 8 && !digitnext) {
+      result += ('0' + o2);
+    } else if (c < 64 && !digitnext) {
+      result += ('0' + o1);
+      result += ('0' + o2);
+    } else {
+      result += ('0' + o0);
+      result += ('0' + o1);
+      result += ('0' + o2);
+    }
+    return result;
+  }
+
+  virtual std::string open() {
+    return "\"";
+  }
+
+  virtual std::string close() {
+    return "\"";
+  }
+
+  virtual std::string linebeg() {
+    return "\"";
+  }
+
+  virtual std::string lineend() {
+    return "\"";
+  }
+
+  virtual bool outwidth() {
+    return true;
+  }
+};
+
+// Java-compatible string, per byte, it does *not* group 2 bytes for UTF-16.
+class JavaString : public Format {
+ public:
+  JavaString() {}
+
+  virtual bool printable() const { return true; }
+
+  std::string encodeChar(unsigned char c, unsigned char prev, unsigned char next) {
+    if(c == '\b') return "\\b";
+    if(c == '\f') return "\\f";
+    if(c == '\n') return "\\n";
+    if(c == '\r') return "\\r";
+    if(c == '\t') return "\\t";
+    if(c == '\\') return "\\\\";
+    if(c == '"') return "\\\"";
+    if(c >= 32 && c < 127) {
+      std::string result;
+      result += c;
+      return result;
+    }
+    // octal: we work byte-based, so don't use \u unicode escapes, which are longer
+    bool digitnext = (next >= '0' && next <= '7');
+    int o0 = (c >> 6) & 7;
+    int o1 = (c >> 3) & 7;
+    int o2 = (c >> 0) & 7;
+    std::string result = "\\";
+    // shorten if possible, e.g. many nulls in a row will be \0\0\0\0 instead of \000\\000\000\000
+    // using \0 and other less than 3 digit codes is only ok if no real octal digit after it, else the next character becomes part of the code
+    if(c < 8 && !digitnext) {
+      result += ('0' + o2);
+    } else if (c < 64 && !digitnext) {
+      result += ('0' + o1);
+      result += ('0' + o2);
+    } else {
+      result += ('0' + o0);
+      result += ('0' + o1);
+      result += ('0' + o2);
+    }
+    return result;
+  }
+
+  virtual std::string open() {
+    return "\"";
+  }
+
+  virtual std::string close() {
+    return "\"";
+  }
+
+  virtual std::string linebeg() {
+    return "\"";
+  }
+
+  virtual std::string lineend() {
+    return "\" +";
+  }
+
+  virtual bool outwidth() {
+    return true;
+  }
+};
+
+// JS-compatible string, per byte, it does *not* group 2 bytes for UTF-16.
+class JSString : public Format {
+ public:
+  JSString() {}
+
+  virtual bool printable() const { return true; }
+
+  std::string encodeChar(unsigned char c, unsigned char prev, unsigned char next) {
+    if(c == '\b') return "\\b";
+    if(c == '\f') return "\\f";
+    if(c == '\n') return "\\n";
+    if(c == '\r') return "\\r";
+    if(c == '\t') return "\\t";
+    if(c == '\\') return "\\\\";
+    if(c == '\'') return "\\'";
+    if(c >= 32 && c < 127) {
+      std::string result;
+      result += c;
+      return result;
+    }
+    // in JS \0 is different than other octal, and should not have any *decimal* digit after it
+    bool digitnext = (next >= '0' && next <= '9');
+    if(c == 0 && !digitnext) return "\\0";
+    int h0 = (c >> 4) & 15;
+    int h1 = (c >> 0) & 15;
+    static const std::string hex = "0123456789ABCDEF";
+    std::string result = "\\x";
+    result += hex[h0];
+    result += hex[h1];
+    return result;
+  }
+
+  virtual std::string open() {
+    return "'";
+  }
+
+  virtual std::string close() {
+    return "'";
+  }
+
+  virtual std::string linebeg() {
+    return "'";
+  }
+
+  virtual std::string lineend() {
+    return "' +";
+  }
+
+  virtual bool outwidth() {
+    return true;
+  }
+};
+
+// Different than JS string: using double quotes, and can only escape with \u, no \x or octal
+class JSONString : public Format {
+ public:
+  JSONString() {}
+
+  virtual bool printable() const { return true; }
+
+  std::string encodeChar(unsigned char c, unsigned char prev, unsigned char next) {
+    if(c == '\b') return "\\b";
+    if(c == '\f') return "\\f";
+    if(c == '\n') return "\\n";
+    if(c == '\r') return "\\r";
+    if(c == '\t') return "\\t";
+    if(c == '\\') return "\\\\";
+    if(c == '\"') return "\\\"";
+    if(c >= 32 && c < 127) {
+      std::string result;
+      result += c;
+      return result;
+    }
+    static const std::string hex = "0123456789ABCDEF";
+    int h0 = (c >> 4) & 15;
+    int h1 = (c >> 0) & 15;
+    std::string result = "\\u00";
+    result += hex[h0];
+    result += hex[h1];
+    return result;
+  }
+
+  virtual std::string open() {
+    return "\"";
+  }
+
+  virtual std::string close() {
+    return "\"";
+  }
+
+  // Cannot break up string into multiple lines in JSON
+  virtual bool allowlinebreaks() {
+    return false;
+  }
+
+  virtual bool outwidth() {
+    return true;
   }
 };
 
@@ -877,7 +1171,7 @@ void printHelp(const UnixArgs& args) {
 int main(int argc, char *argv[]) {
   UnixArgs args;
   args.registerArg('h', "help", "show this help");
-  args.registerArg('H', "", "show a reference of characters for currently selected format");
+  args.registerArg('H', "table", "show a reference of characters for currently selected format");
   args.registerArg(0, "tables", "show tables of all existing formats (printed result depends on modifications like --color)");
   args.registerArg('d', "decode", "decode back from the format to binary data. Only works for some formats, and only without line numbers and without printnewline.");
   args.registerArg(0, "format", "Format to use. Use -H or --tables to view their tables. Formats:\n"
@@ -890,11 +1184,14 @@ int main(int argc, char *argv[]) {
       "      oct: print bytes in octal\n"
       "      bin: print bytes in binary\n"
       "      low: characters are shown as their least significant hex digit (use --mix to recover printable chars)\n"
-      "      high: characters are shown as their most significant hex digit (use --mix to recover printable chars)"
-      "      colored: Uses the 256 ANSI colors for terminal (requires 256 background color support in the terminal)"
-      "",
+      "      high: characters are shown as their most significant hex digit (use --mix to recover printable chars)\n"
+      "      colored: Uses the 256 ANSI colors. Requires 256 background color support in terminal. Different than --color.\n"
+      "      c: ANSI C string literal\n"
+      "      java: Java string literal (byte based, no UTF-16)\n"
+      "      js: JS string literal (byte based, no UTF-16)\n"
+      "      json: JSON string literal",
       "cp437");
-  args.registerArg('m', "mix", "In the format, use ASCII characters instead of the format's character for any actual ASCII character code.");
+  args.registerArg('m', "mix", "Override the format for printable ASCII characters with the printable ASCII characters themselves.");
   args.registerArg(0, "printnewline", "Print newlines as actual newline in modes 'cp437', 'cp1252' and 'ascii'.");
   args.registerArg(0, "printspace", "For any format that uses ASCII characters but doesn't print space as empty, print the space as empty space anyway.");
   args.registerArg(0, "printnull", "For formats where null is normally invisible but a 'empty set' symbol is printed, use invisible character anyway.");
@@ -908,8 +1205,8 @@ int main(int argc, char *argv[]) {
   args.registerArg(0, "comma", "Add comma between characters (useful for numeric formats).");
   args.registerArg(0, "lower", "Use lower case instead of upper case for hex digits.");
   args.registerArg(0, "upper", "Use upper case hex digits (no need to give this flag, uppercase is the default).");
-  args.registerArg('c', "color", "Use ANSI color codes (works in unix shell) for non-ASCII characters.");
-  args.registerArg(0, "wrap", "Add newlines every amount of bytes", "64");
+  args.registerArg('c', "color", "Use ANSI color codes (works in unix shell) for non-ASCII characters, based on high hex digit.");
+  args.registerArg(0, "wrap", "Add newlines every so many bytes", "64");
   args.registerArg('w', "", "shortcut for --wrap=64");
   args.registerArg('W', "", "shortcut for --wrap=100");
   args.registerArg('n', "", "no extra newline at end of output.");
@@ -967,6 +1264,10 @@ int main(int argc, char *argv[]) {
   formats.push_back({"low", new Low(printnewline, lower)});
   formats.push_back({"high", new High(printnewline, lower)});
   formats.push_back({"colored", new Colored()});
+  formats.push_back({"c", new CString()});
+  formats.push_back({"java", new JavaString()});
+  formats.push_back({"js", new JSString()});
+  formats.push_back({"json", new JSONString()});
 
   // The format that is itself colored is incompatible with the extra coloring
   if(colored && nstring == "colored") colored = false;
@@ -980,10 +1281,7 @@ int main(int argc, char *argv[]) {
 
   if(args.present("tables")) {
     for(size_t i = 0; i < formats.size(); i++) {
-      bool both = true;
-      if(formats[i].first == "cp437") both = false;
-      if(formats[i].first == "cp1252") both = false;
-      if(formats[i].first == "ascii") both = false;
+      bool both = !formats[i].second->printable();
       for(size_t mix = 0; mix <= 1; mix++) {
         if(!both && mix == 1) continue;
         if(both) {
