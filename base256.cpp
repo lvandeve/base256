@@ -420,6 +420,13 @@ class Format {
     return "";
   }
 
+  // some don't support streaming due to using open and close
+  // TODO: redesign the Format API to always stream for both encode and
+  //       decode and have the Printer use those in a streaming manner
+  virtual bool supportsStreaming() const {
+    return true;
+  }
+
   // size (in glyphs) of each printed byte
   virtual int width() const {
     return 1;
@@ -742,6 +749,79 @@ class High : public Format {
   bool newline;
 };
 
+class Base64 : public Format {
+ public:
+  Base64() {}
+
+  virtual bool supportsStreaming() const {
+    return false;
+  }
+
+  std::string encodeChar(unsigned char c, unsigned char prev, unsigned char next) {
+    int r = num % 3;
+    num++;
+    if(r == 0) v = (c << 16u);
+    else if(r == 1) v |= (c << 8u);
+    else v |= c;
+    std::string result;
+    if(r == 0) {
+      result += BASE64[(v >> 18) & 0x3f];
+    } else if(r == 1) {
+      result += BASE64[(v >> 12) & 0x3f];
+    } else {
+      result += BASE64[(v >>  6) & 0x3f];
+      result += BASE64[(v >>  0) & 0x3f];
+    }
+    return result;
+  }
+
+  virtual std::string close() {
+    int r = num % 3;
+    std::string result;
+    if(r == 0) {
+    }
+    if(r == 1) {
+      result += BASE64[(v >> 12) & 0x3f];
+      result += "==";
+    }
+    if(r == 2) {
+      result += BASE64[(v >> 6) & 0x3f];
+      result += "=";
+    }
+    return result;
+  }
+
+  int fromBase64(int v) {
+    if(v >= 'A' && v <= 'Z') return (v - 'A');
+    if(v >= 'a' && v <= 'z') return (v - 'a' + 26);
+    if(v >= '0' && v <= '9') return (v - '0' + 52);
+    if(v == '+') return 62;
+    if(v == '/') return 63;
+    return 0; //v == '='
+  }
+
+
+  std::string decode(const std::string& s) {
+    std::string result;
+    for(size_t i = 0; i + 3 < s.size(); i += 4) {
+      int v = 262144 * fromBase64(s[i]) + 4096 * fromBase64(s[i + 1]) + 64 * fromBase64(s[i + 2]) + fromBase64(s[i + 3]);
+      result += ((v >> 16) & 0xff);
+      if(s[i + 2] != '=') result += ((v >> 8) & 0xff);
+      if(s[i + 3] != '=') result += ((v >> 0) & 0xff);
+    }
+    return result;
+  }
+
+  virtual int width() const {
+    return 1;
+  }
+
+  const char* BASE64 = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+  size_t v = 0;
+  size_t num = 0;
+};
+
 class Hex : public Format {
  public:
   Hex(bool prefix = false, bool lower = false) : prefix(prefix),
@@ -960,6 +1040,10 @@ class CString : public Format {
     return result;
   }
 
+  virtual bool supportsStreaming() const {
+    return false;
+  }
+
   virtual std::string open() {
     return "\"";
   }
@@ -1022,6 +1106,10 @@ class JavaString : public Format {
     return result;
   }
 
+  virtual bool supportsStreaming() const {
+    return false;
+  }
+
   virtual std::string open() {
     return "\"";
   }
@@ -1075,6 +1163,10 @@ class JSString : public Format {
     return result;
   }
 
+  virtual bool supportsStreaming() const {
+    return false;
+  }
+
   virtual std::string open() {
     return "'";
   }
@@ -1125,6 +1217,10 @@ class JSONString : public Format {
     return result;
   }
 
+  virtual bool supportsStreaming() const {
+    return false;
+  }
+
   virtual std::string open() {
     return "\"";
   }
@@ -1162,7 +1258,7 @@ void printHelp(const UnixArgs& args) {
                "\n";
 
   std::cout << "Usage:" << std::endl;
-  std::cout << args.binary << " [-options] [in.bin] [out.txt]" << std::endl;
+  std::cout << args.binary << " [-options] [in.bin] [--outfile=out.txt]" << std::endl;
   std::cout << std::endl;
   std::cout << "Options:" << std::endl;
   args.printHelp(2);
@@ -1173,6 +1269,7 @@ int main(int argc, char *argv[]) {
   args.registerArg('h', "help", "show this help");
   args.registerArg('H', "table", "show a reference of characters for currently selected format");
   args.registerArg(0, "tables", "show tables of all existing formats (printed result depends on modifications like --color)");
+  args.registerArg(0, "outfile", "write to given output file instead of printing in terminal");
   args.registerArg('d', "decode", "decode back from the format to binary data. Only works for some formats, and only without line numbers and without printnewline.");
   args.registerArg(0, "format", "Format to use. Use -H or --tables to view their tables. Formats:\n"
       "      cp437: 256 unique characters, based on code page 437 (with small modifications to make all unique and none empty)\n"
@@ -1186,7 +1283,7 @@ int main(int argc, char *argv[]) {
       "      low: characters are shown as their least significant hex digit (use --mix to recover printable chars)\n"
       "      high: characters are shown as their most significant hex digit (use --mix to recover printable chars)\n"
       "      colored: Uses the 256 ANSI colors. Requires 256 background color support in terminal. Different than --color.\n"
-      "      c: ANSI C string literal\n"
+      "      c: ANSI C string literal (note that C ends strings at the first \\0. Use --size to print length too.)\n"
       "      java: Java string literal (byte based, no UTF-16)\n"
       "      js: JS string literal (byte based, no UTF-16)\n"
       "      json: JSON string literal",
@@ -1205,13 +1302,15 @@ int main(int argc, char *argv[]) {
   args.registerArg(0, "comma", "Add comma between characters (useful for numeric formats).");
   args.registerArg(0, "lower", "Use lower case instead of upper case for hex digits.");
   args.registerArg(0, "upper", "Use upper case hex digits (no need to give this flag, uppercase is the default).");
-  args.registerArg('c', "color", "Use ANSI color codes (works in unix shell) for non-ASCII characters, based on high hex digit.");
-  args.registerArg(0, "wrap", "Add newlines every so many bytes", "64");
+  args.registerArg('c', "color", "Use ANSI color codes (works in unix shell) for non-ASCII characters, based on high hex digit (works with all format, is independent from --format=colored).");
+  args.registerArg('n', "", "no extra newline at end of output.");
+  // TODO: use "wrap" for output bytes instead and call it "align" for input bytes
+  args.registerArg(0, "wrap", "Add newlines every so many input bytes", "64");
   args.registerArg('w', "", "shortcut for --wrap=64");
   args.registerArg('W', "", "shortcut for --wrap=100");
-  args.registerArg('n', "", "no extra newline at end of output.");
   args.registerArg('l', "", "display line numbers (starting byte index), in decimal. Only useful with wrap or printnewline.");
   args.registerArg('L', "", "display line numbers (starting byte index), in hexadecimal. Only useful with wrap or printnewline.");
+  args.registerArg('s', "size", "print size in bytes at the end");
 
   if(!args.parse(argc, argv) || args.present("help")) {
     printHelp(args);
@@ -1219,7 +1318,7 @@ int main(int argc, char *argv[]) {
   }
 
   std::string infile = args.loose.size() > 0 ? args.loose[0] : "";
-  std::string outfile = args.loose.size() > 1 ? args.loose[1] : "";
+  std::string outfile = args.present("outfile") ? args.value("outfile") : "";
 
   bool mix = args.present("mix");
   bool printspace = args.present("printspace");
@@ -1231,14 +1330,16 @@ int main(int argc, char *argv[]) {
   bool lower = args.present("lower") || !args.present("upper");
   bool printlinenumbers = args.present('l') || args.present('L');
   int linenumbersbase = args.present('L') ? 16 : 10;
+  bool printsize = args.present('s') || args.present("size");
+  size_t size = 0;
 
-  std::string nstring = args.value("format");
-  if(args.present('x')) nstring = "hex";
-  if(args.present('0')) nstring = "dec";
-  if(args.present('1')) nstring = "cp1252";
-  if(args.present('4')) nstring = "cp437";
-  if(args.present('a')) nstring = "ascii";
-  if(args.present('m')) { nstring = "hex"; mix = true; }
+  std::string formatname = args.value("format");
+  if(args.present('x')) formatname = "hex";
+  if(args.present('0')) formatname = "dec";
+  if(args.present('1')) formatname = "cp1252";
+  if(args.present('4')) formatname = "cp437";
+  if(args.present('a')) formatname = "ascii";
+  if(args.present('m')) { formatname = "hex"; mix = true; }
 
   int wrap = 0;
   if(args.present("wrap")) {
@@ -1257,6 +1358,7 @@ int main(int argc, char *argv[]) {
   formats.push_back({"cp1252", new CP1252(printnewline, printnull)});
   formats.push_back({"braille", new Braille(printnewline, printnull)});
   formats.push_back({"ascii", new ASCII(printnewline)});
+  formats.push_back({"base64", new Base64});
   formats.push_back({"hex", new Hex(prefix, lower)});
   formats.push_back({"dec", new Decimal(prefix)});
   formats.push_back({"oct", new Octal(prefix)});
@@ -1270,12 +1372,21 @@ int main(int argc, char *argv[]) {
   formats.push_back({"json", new JSONString()});
 
   // The format that is itself colored is incompatible with the extra coloring
-  if(colored && nstring == "colored") colored = false;
+  if(colored && formatname == "colored") colored = false;
 
   Format* format = formats[0].second;
-  for(size_t i = 0; i < formats.size(); i++) {
-    if(nstring == formats[i].first) {
-      format = formats[i].second;
+  if(formatname != "") {
+    bool found = false;
+    for(size_t i = 0; i < formats.size(); i++) {
+      if(formatname == formats[i].first) {
+        format = formats[i].second;
+        found = true;
+        break;
+      }
+    }
+    if(!found) {
+      std::cout << "unknown format: " << formatname << std::endl;
+      return 1;
     }
   }
 
@@ -1321,13 +1432,15 @@ int main(int argc, char *argv[]) {
   bool decode = args.present('d');
 
   // streaming
-  if(infile.empty() && outfile.empty() && !decode) {
+  if(infile.empty() && outfile.empty() && !decode && format->supportsStreaming()) {
     char c;
     std::string s = "a";
     while(std::cin.get(c)) {
       s[0] = c;
       std::cout << printer.encode(s);
+      size++;
     }
+    if(printsize) std::cout << std::endl << "size: " << size;
     if(!decode && !args.present('n')) std::cout << std::endl;
     return 0;
   }
@@ -1350,14 +1463,18 @@ int main(int argc, char *argv[]) {
 
   if(decode) {
     result = printer.decode(file);
+    size = result.size();
   } else {
     result = printer.encode(file);
+    size = file.size();
   }
 
   if(outfile.empty()) {
     std::cout << result;
+    if(printsize) std::cout << std::endl << "size: " << size;
     if(!decode && !args.present('n')) std::cout << std::endl;
   } else {
+    if(printsize) result += "\nsize: " + valtostr(size);
     if(!decode && !args.present('n')) result += "\n";
     save_file(result, outfile);
   }
