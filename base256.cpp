@@ -566,7 +566,30 @@ class Printer {
   }
 
   std::string decode(const std::string& s) {
-    return n->decode(s);
+    if(mix) {
+      std::string result;
+      for(size_t i = 0; i < s.size(); i++) {
+        // 32 is space, anything <= 32 is considered whitespace
+        while(i < s.size() && (s[i] <= 32)) i++;
+        if(i == s.size()) break;
+        size_t j = i + 1;
+        while(j < s.size() && (s[j] > 32)) j++;
+        size_t size = j - i;
+        if(size == 1) {
+          char c = s[i];
+          if(c > 32 && c < 127) {
+            result += c;
+            i = j;
+            continue;
+          }
+        }
+        result += n->decode(s.substr(i, j - i));
+        i = j;
+      }
+      return result;
+    } else {
+      return n->decode(s);
+    }
   }
 
   std::string getTable() {
@@ -612,6 +635,7 @@ class Printer {
   bool mix = false;
   bool printnewline = false;
   bool printspace = false;
+  bool lsb_first = false;
 };
 
 class CP437 : public Format {
@@ -956,13 +980,17 @@ class Octal : public Format {
 
 class Binary : public Format {
  public:
-  Binary(bool prefix = false) : prefix(prefix) {
+  Binary(bool lsb_first, bool prefix = false) : lsb_first(lsb_first), prefix(prefix) {
   }
 
   std::string encodeChar(unsigned char c, unsigned char prev, unsigned char next) {
     std::string result;
     for(int j = 0; j < 8; j++) {
-      result += ((c >> (7 - j)) & 1) ? '1' : '0';
+      if(lsb_first) {
+        result += ((c >> j) & 1) ? '1' : '0';
+      } else {
+        result += ((c >> (7 - j)) & 1) ? '1' : '0';
+      }
     }
     if(prefix) result = "0b" + result;
     return result;
@@ -976,7 +1004,38 @@ class Binary : public Format {
     return true;
   }
 
+
+
+  std::string decode(const std::string& s) {
+    std::string result;
+    int count = 0;
+    int val = 0;
+    for(size_t i = 0; i < s.size(); i++) {
+      char c = s[i];
+      if(c != '0' && c != '1') continue;
+      if(lsb_first) {
+        val |= (c == '1' ? 1 : 0) << count;
+      } else {
+        val <<= 1;
+        val |= (c == '1' ? 1 : 0);
+      }
+      count++;
+      if(count == 8) {
+        count = 0;
+        char c2 = val;
+        result += c2;
+        val = 0;
+      }
+    }
+    if(count != 0) {
+      char c2 = val;
+      result += c2;
+    }
+    return result;
+  }
+
   bool prefix;
+  bool lsb_first;
 };
 
 
@@ -1001,6 +1060,7 @@ class CString : public Format {
   virtual bool printable() const { return true; }
 
   std::string encodeChar(unsigned char c, unsigned char prev, unsigned char next) {
+    size++;
     if(c == '\a') return "\\a";
     if(c == '\b') return "\\b";
     if(c == '\f') return "\\f";
@@ -1049,7 +1109,7 @@ class CString : public Format {
   }
 
   virtual std::string close() {
-    return "\"";
+    return "\" /*size:" + valtostr(size) + "+1*/";
   }
 
   virtual std::string linebeg() {
@@ -1063,6 +1123,83 @@ class CString : public Format {
   virtual bool outwidth() {
     return true;
   }
+
+  size_t size = 0;
+};
+
+// C++ string with size given to the constructor as well so that it can contain null characters
+class CPPString : public Format {
+ public:
+  CPPString() {}
+
+  virtual bool printable() const { return true; }
+
+  std::string encodeChar(unsigned char c, unsigned char prev, unsigned char next) {
+    size++;
+    if(c == '\a') return "\\a";
+    if(c == '\b') return "\\b";
+    if(c == '\f') return "\\f";
+    if(c == '\n') return "\\n";
+    if(c == '\r') return "\\r";
+    if(c == '\t') return "\\t";
+    if(c == '\v') return "\\v";
+    if(c == '\\') return "\\\\";
+    if(c == '"') return "\\\"";
+    if(c == '?' && prev == '?') return "\\?"; // prevent trigraphs
+    if(c >= 32 && c < 127) {
+      std::string result;
+      result += c;
+      return result;
+    }
+    // octal
+    // octal is used, not hexadecimal ("\x..."), because octal is defined to end after 3 characters, while
+    // hexadecimal can keep going on indefinitely (it doesn't end after 2) as long as valid hex digits follow,
+    // so hexadecimal is harder to deal with if an actual 0-7 or a-f character would follow (requires ending and reopening the string literal)
+    bool digitnext = (next >= '0' && next <= '7');
+    int o0 = (c >> 6) & 7;
+    int o1 = (c >> 3) & 7;
+    int o2 = (c >> 0) & 7;
+    std::string result = "\\";
+    // shorten if possible, e.g. many nulls in a row will be \0\0\0\0 instead of \000\\000\000\000
+    // using \0 and other less than 3 digit codes is only ok if no real octal digit after it, else the next character becomes part of the code
+    if(c < 8 && !digitnext) {
+      result += ('0' + o2);
+    } else if (c < 64 && !digitnext) {
+      result += ('0' + o1);
+      result += ('0' + o2);
+    } else {
+      result += ('0' + o0);
+      result += ('0' + o1);
+      result += ('0' + o2);
+    }
+    return result;
+  }
+
+  virtual bool supportsStreaming() const {
+    return false;
+  }
+
+  virtual std::string open() {
+    return "std::string(\"";
+  }
+
+  virtual std::string close() {
+    return "\", " + valtostr(size) + ")";
+  }
+
+  virtual std::string linebeg() {
+    return "\"";
+  }
+
+  virtual std::string lineend() {
+    return "\"";
+  }
+
+  virtual bool outwidth() {
+    return true;
+  }
+
+  size_t size = 0;
 };
 
 // Java-compatible string, per byte, it does *not* group 2 bytes for UTF-16.
@@ -1188,6 +1325,63 @@ class JSString : public Format {
   }
 };
 
+
+class PythonString : public Format {
+ public:
+  PythonString() {}
+
+  virtual bool printable() const { return true; }
+
+  std::string encodeChar(unsigned char c, unsigned char prev, unsigned char next) {
+    if(c == '\b') return "\\b";
+    if(c == '\f') return "\\f";
+    if(c == '\n') return "\\n";
+    if(c == '\r') return "\\r";
+    if(c == '\t') return "\\t";
+    if(c == '\\') return "\\\\";
+    if(c == '\'') return "\\'";
+    if(c >= 32 && c < 127) {
+      std::string result;
+      result += c;
+      return result;
+    }
+    // octal \0 should not have any *decimal* digit after it
+    bool digitnext = (next >= '0' && next <= '9');
+    if(c == 0 && !digitnext) return "\\0";
+    int h0 = (c >> 4) & 15;
+    int h1 = (c >> 0) & 15;
+    static const std::string hex = "0123456789ABCDEF";
+    std::string result = "\\x";
+    result += hex[h0];
+    result += hex[h1];
+    return result;
+  }
+
+  virtual bool supportsStreaming() const {
+    return false;
+  }
+
+  virtual std::string open() {
+    return "'";
+  }
+
+  virtual std::string close() {
+    return "'";
+  }
+
+  virtual std::string linebeg() {
+    return "";
+  }
+
+  virtual std::string lineend() {
+    return "\\";
+  }
+
+  virtual bool outwidth() {
+    return true;
+  }
+};
+
 // Different than JS string: using double quotes, and can only escape with \u, no \x or octal
 class JSONString : public Format {
  public:
@@ -1283,10 +1477,12 @@ int main(int argc, char *argv[]) {
       "      low: characters are shown as their least significant hex digit (use --mix to recover printable chars)\n"
       "      high: characters are shown as their most significant hex digit (use --mix to recover printable chars)\n"
       "      colored: Uses the 256 ANSI colors. Requires 256 background color support in terminal. Different than --color.\n"
-      "      c: ANSI C string literal (note that C ends strings at the first \\0. Use --size to print length too.)\n"
+      "      c: ANSI C string literal (note that C ends strings at the first \\0 but can still address the rest)\n"
+      "      cpp: C++ std::string initializer with size\n"
       "      java: Java string literal (byte based, no UTF-16)\n"
       "      js: JS string literal (byte based, no UTF-16)\n"
-      "      json: JSON string literal",
+      "      json: JSON string literal\n"
+      "      python: python string literal",
       "cp437");
   args.registerArg('m', "mix", "Override the format for printable ASCII characters with the printable ASCII characters themselves.");
   args.registerArg(0, "printnewline", "Print newlines as actual newline in modes 'cp437', 'cp1252' and 'ascii'.");
@@ -1311,6 +1507,7 @@ int main(int argc, char *argv[]) {
   args.registerArg('l', "", "display line numbers (starting byte index), in decimal. Only useful with wrap or printnewline.");
   args.registerArg('L', "", "display line numbers (starting byte index), in hexadecimal. Only useful with wrap or printnewline.");
   args.registerArg('s', "size", "print size in bytes at the end");
+  args.registerArg(0, "lsb_first", "when printing in binary mode, print the lsb first instead of the msb first");
 
   if(!args.parse(argc, argv) || args.present("help")) {
     printHelp(args);
@@ -1341,6 +1538,11 @@ int main(int argc, char *argv[]) {
   if(args.present('a')) formatname = "ascii";
   if(args.present('m')) { formatname = "hex"; mix = true; }
 
+  bool lsb_first = false;
+  if(args.present("lsb_first")) {
+    lsb_first = true;
+  }
+
   int wrap = 0;
   if(args.present("wrap")) {
     wrap = 64;
@@ -1362,14 +1564,16 @@ int main(int argc, char *argv[]) {
   formats.push_back({"hex", new Hex(prefix, lower)});
   formats.push_back({"dec", new Decimal(prefix)});
   formats.push_back({"oct", new Octal(prefix)});
-  formats.push_back({"bin", new Binary(prefix)});
+  formats.push_back({"bin", new Binary(lsb_first, prefix)});
   formats.push_back({"low", new Low(printnewline, lower)});
   formats.push_back({"high", new High(printnewline, lower)});
   formats.push_back({"colored", new Colored()});
   formats.push_back({"c", new CString()});
+  formats.push_back({"cpp", new CPPString()});
   formats.push_back({"java", new JavaString()});
   formats.push_back({"js", new JSString()});
   formats.push_back({"json", new JSONString()});
+  formats.push_back({"python", new PythonString()});
 
   // The format that is itself colored is incompatible with the extra coloring
   if(colored && formatname == "colored") colored = false;
@@ -1423,6 +1627,7 @@ int main(int argc, char *argv[]) {
   printer.printnewline = printnewline;
   printer.printspace = printspace;
   printer.wrap = wrap;
+  printer.lsb_first = lsb_first;
 
   if(args.present('H')) {
     std::cout << printer.getTable() << std::endl;
@@ -1448,6 +1653,7 @@ int main(int argc, char *argv[]) {
   // non streaming, file based
   std::string file;
   if(!infile.empty()) {
+    // TODO: don't load file at once like this, stream it, otherwise some system files that don't allow seeking aren't supported (e.g. under /proc)
     if(!load_file(infile, &file)) {
       std::cout << "invalid input file (use -h for help)" << std::endl;
       return 1;
